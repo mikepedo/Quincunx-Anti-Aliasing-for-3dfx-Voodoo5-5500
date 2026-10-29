@@ -1,0 +1,19 @@
+diff --git a/src/mesa/drivers/glide/fxapi.c b/src/mesa/drivers/glide/fxapi.c
+index 2cc941c..70c948e 100644
+--- a/src/mesa/drivers/glide/fxapi.c
++++ b/src/mesa/drivers/glide/fxapi.c
+@@ -555,6 +555,14 @@ fxMesa->keepResidentOnInvalidate = GL_TRUE;
+              if ((str = Glide->grGetRegistryOrEnvironmentStringExt("SSTH3_SLI_AA_CONFIGURATION")) != NULL) {
+                 sliaa = atoi(str);
+              }
++             /* Quincunx 1.0: 9/10/11 are 2-sample AA on 1/2/4 chips with the
++              * Quincunx resolve done inside Glide; request the base 2x format. */
++             switch (sliaa) {
++                case 9:  sliaa = 1; break;
++                case 10: sliaa = 3; break;
++                case 11: sliaa = 6; break;
++                default: break;
++             }
+              fxMesa->bgrOrder = GL_FALSE;     /* correct for Voodoo 4/5 */
+              fxMesa->snapVertices = GL_FALSE;
+              break;

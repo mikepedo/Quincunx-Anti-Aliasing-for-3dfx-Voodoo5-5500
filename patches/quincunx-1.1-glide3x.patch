@@ -1,0 +1,859 @@
+diff --git a/glide3x/h5/glide3/src/fxglide.h b/glide3x/h5/glide3/src/fxglide.h
+index 680229f..89e0e8d 100644
+--- a/glide3x/h5/glide3/src/fxglide.h
++++ b/glide3x/h5/glide3/src/fxglide.h
+@@ -1,4 +1,10 @@
+ /*
++** MODIFIED FILE - Quincunx 1.1 (Quincunx anti-aliasing for the Voodoo5 5500).
++** Changed from the 3dfx sources 3.10.0.40408 in October 2026
++** (Quincunx 1.0: 25-26 Oct 2026, Quincunx 1.1: 26-29 Oct 2026).
++** Every change is marked "Quincunx" in the comments.
++*/
++/*
+ ** THIS SOFTWARE IS SUBJECT TO COPYRIGHT PROTECTION AND IS OFFERED ONL
+ ** PURSUANT TO THE 3DFX GLIDE GENERAL PUBLIC LICENSE. THERE IS NO RIGH
+ ** TO USE THE GLIDE TRADEMARK WITHOUT PRIOR WRITTEN PERMISSION OF 3DF
+@@ -2129,6 +2135,9 @@ struct _GlideRoot_s {
+     FxU32  forceSingleChip ;    /* force off SLI */
+     FxU32  outputBpp ;          /* force 16/32bpp rendering */
+     FxU32  aaSample ;           /* force 2/4 sample anti-aliasing */
++    FxU32  quincunxMode ;       /* Quincunx 1.0: 0=off, 9/10/11 requested
++                                   via SSTH3_SLI_AA_CONFIGURATION */
++    FxI32  quincunxCfg ;        /* SLI/AA setting after Quincunx expansion */
+ 
+     FxU32  columnWidth;         /* 'n' in columns of n */
+ 
+diff --git a/glide3x/h5/glide3/src/gpci.c b/glide3x/h5/glide3/src/gpci.c
+index de33bb5..b742edf 100644
+--- a/glide3x/h5/glide3/src/gpci.c
++++ b/glide3x/h5/glide3/src/gpci.c
+@@ -1,4 +1,10 @@
+ /*
++** MODIFIED FILE - Quincunx 1.1 (Quincunx anti-aliasing for the Voodoo5 5500).
++** Changed from the 3dfx sources 3.10.0.40408 in October 2026
++** (Quincunx 1.0: 25-26 Oct 2026, Quincunx 1.1: 26-29 Oct 2026).
++** Every change is marked "Quincunx" in the comments.
++*/
++/*
+ ** THIS SOFTWARE IS SUBJECT TO COPYRIGHT PROTECTION AND IS OFFERED ONL
+ ** PURSUANT TO THE 3DFX GLIDE GENERAL PUBLIC LICENSE. THERE IS NO RIGH
+ ** TO USE THE GLIDE TRADEMARK WITHOUT PRIOR WRITTEN PERMISSION OF 3DF
+@@ -1856,9 +1862,31 @@ _GlideInitEnvironment(void)
+    */
+   _GlideRoot.environment.forceSingleChip = 0 ;
+   _GlideRoot.environment.aaSample = 0 ;
+-  
+-  switch(GLIDE_GETENV("SSTH3_SLI_AA_CONFIGURATION", 2L))
+-    { 
++  _GlideRoot.environment.quincunxMode = 0 ;
++
++  /* Quincunx 1.1 (Voodoo5 5500)
++   *
++   *      10 - Quincunx sharper  : expands to setting 3 (2x AA, 2 chips)
++   *      11 - Quincunx smoother : expands to setting 3 (2x AA, 2 chips)
++   *
++   * The value is remembered in quincunxMode and the base 2-sample
++   * configuration is used for everything else.  On any other board, or
++   * when the video path is not usable, the result is stock 2x AA.
++   */
++  _GlideRoot.environment.quincunxCfg = GLIDE_GETENV("SSTH3_SLI_AA_CONFIGURATION", 2L);
++  switch (_GlideRoot.environment.quincunxCfg)
++    {
++    case 10:
++    case 11:
++      _GlideRoot.environment.quincunxMode = _GlideRoot.environment.quincunxCfg ;
++      _GlideRoot.environment.quincunxCfg = 3 ;
++      break ;
++    default:
++      break ;
++    }
++
++  switch(_GlideRoot.environment.quincunxCfg)
++    {
+     case 1:
+       _GlideRoot.environment.aaSample = 2 ;
+     case 0:
+diff --git a/glide3x/h5/glide3/src/gsst.c b/glide3x/h5/glide3/src/gsst.c
+index af05db2..d30c25d 100644
+--- a/glide3x/h5/glide3/src/gsst.c
++++ b/glide3x/h5/glide3/src/gsst.c
+@@ -1,5 +1,11 @@
+ /* -*-c++-*- */
+ /*
++** MODIFIED FILE - Quincunx 1.1 (Quincunx anti-aliasing for the Voodoo5 5500).
++** Changed from the 3dfx sources 3.10.0.40408 in October 2026
++** (Quincunx 1.0: 25-26 Oct 2026, Quincunx 1.1: 26-29 Oct 2026).
++** Every change is marked "Quincunx" in the comments.
++*/
++/*
+ ** THIS SOFTWARE IS SUBJECT TO COPYRIGHT PROTECTION AND IS OFFERED ONL
+ ** PURSUANT TO THE 3DFX GLIDE GENERAL PUBLIC LICENSE. THERE IS NO RIGH
+ ** TO USE THE GLIDE TRADEMARK WITHOUT PRIOR WRITTEN PERMISSION OF 3DF
+@@ -1402,6 +1408,191 @@ void initGC(GrGC *gc)
+ #undef FN_NAME
+ } /* initGC */
+ 
++/*-------------------------------------------------------------------
++  Quincunx 1.0 - sample placement
++
++  On a dual VSA-100 board running 2-sample AA without SLI each chip
++  renders one complete sample and the digital AA mux averages the two
++  video PIPEs.  Quincunx keeps chip 0 on the pixel centre and moves
++  chip 1 onto the pixel corner; minihwc then turns chip 1's overlay
++  scaler into a half-phase bilinear filter, so its PIPE carries the
++  average of the four corners around every pixel:
++
++      OUT = 1/2 centre + 1/8 (four corners)
++
++  The jitter values use the same string format as FX_GLIDE_AA2_OFFSET_*
++  and can be overridden for calibration on real hardware.
++
++  Measured on a Voodoo5 5500 (read-back of both chips, 1/16 pixel steps):
++  in Glide screen space a pixel's sample sits on the integer coordinate,
++  and the AA offsets act as vertex offsets, so a value of +0.5 places the
++  sample at -0.5, i.e. on the pixel's top-left corner.  With centre 0.0
++  and corner 0.5 the slave's bilinear half-phase filter averages the four
++  corners symmetrically around the master sample (checked on screen with
++  the qxpattern colour test).
++  -------------------------------------------------------------------*/
++static FxBool qxJitterRowSaved = FXFALSE;
++static int    qxJitterRowIndex = 0;
++static FxU32  qxJitterSavedX[8];
++static FxU32  qxJitterSavedY[8];
++
++static FxU32
++_grQxJitterValue(const char *envName, const char *defVal, FxBool negate)
++{
++  const char *envStr = GETENV(envName);
++  float value = (float)atof((envStr != NULL) ? envStr : defVal);
++
++  if (negate)
++    value = -value;
++
++  /* Same encoding as GLIDE_34GETENV in gpci.c (3.4, +0.5 bias). */
++  return (FxU32)((((signed char)(value * 16.0f)) + 8) & 0x7f);
++}
++
++/* Quincunx 1.1: FX_GLIDE_AA_CLIP (on by default) keeps both chips off
++ * row 0 and column 0 whenever AA is on.  With Quincunx the master samples
++ * exactly there, so the whole first line was lost (seen on hardware with a
++ * lower-left origin: the bottom line of the qxpattern frame disappeared).
++ * It is turned off for Quincunx opens unless the user sets it explicitly. */
++static FxBool qxAaClipSaved = FXFALSE;
++static FxBool qxAaClipValue;
++
++/* Put back the jitter row and the AA clip changed by a Quincunx open. */
++static void
++_grQuincunxRestoreJitter(void)
++{
++  int i;
++
++  if (qxAaClipSaved)
++  {
++    _GlideRoot.environment.aaClip = qxAaClipValue;
++    qxAaClipSaved = FXFALSE;
++  }
++
++  if (!qxJitterRowSaved)
++    return;
++
++  for (i = 0; i < 8; i++)
++  {
++    _GlideRoot.environment.aaXOffset[qxJitterRowIndex][i] = qxJitterSavedX[i];
++    _GlideRoot.environment.aaYOffset[qxJitterRowIndex][i] = qxJitterSavedY[i];
++  }
++  qxJitterRowSaved = FXFALSE;
++}
++
++static void
++_grQuincunxSetup(GrGC *gc)
++{
++#define FN_NAME "_grQuincunxSetup"
++  const char *envStr;
++  int i;
++
++  /* Undo the jitter of a previous Quincunx open in this process. */
++  _grQuincunxRestoreJitter();
++
++  gc->bInfo->h3quincunx = 0;
++
++  if (_GlideRoot.environment.quincunxMode == 0)
++    return;
++
++  /* 10 = Quincunx sharper, 11 = Quincunx smoother (Voodoo5 5500 only). */
++  if ((_GlideRoot.environment.quincunxMode != 10) &&
++      (_GlideRoot.environment.quincunxMode != 11))
++  {
++    GDBG_INFO(80, "%s: Quincunx %d has no hardware path yet, running stock 2x AA\n",
++              FN_NAME, _GlideRoot.environment.quincunxMode);
++    return;
++  }
++
++  /* Dual chip, 2 samples, one sample per chip, no SLI, digital mux. */
++  if (!IS_NAPALM(gc->bInfo->pciInfo.deviceID) ||
++      (gc->chipCount != 2) ||
++      (gc->grPixelSample != 2) ||
++      (gc->grSamplesPerChip != 1) ||
++      (gc->sliCount != 1) ||
++      (gc->bInfo->h3analogSli != 0) ||
++      (gc->sampleOffsetIndex < 0) || (gc->sampleOffsetIndex > 14))
++  {
++    GDBG_INFO(80, "%s: configuration not eligible (chips=%d samples=%d perChip=%d sli=%d analog=%d)\n",
++              FN_NAME, gc->chipCount, gc->grPixelSample, gc->grSamplesPerChip,
++              gc->sliCount, gc->bInfo->h3analogSli);
++    return;
++  }
++
++  /* Quincunx 1.1 variants (h3quincunx, read by minihwc):
++   *   1 sharper  (10): master centre unfiltered + slave corner filtered
++   *                    = 1/2 centre + 1/8 x 4 corners (the 1.0 kernel)
++   *   2 smoother (11): as sharper, but the master scaler filters too, so the
++   *                    master gives the mean of 4 centres and the slave the
++   *                    mean of 4 corners.  The two means sit a quarter pixel
++   *                    apart: an even 4-tap box per axis (taps 0.5 px apart),
++   *                    and the whole image moves by a quarter pixel.
++   * Both render like 2x AA; the smoother adds the filter read on the master
++   * (Quake III 1024x768x32 on a 5500: 2x 31.5, sharper 30.4 fps; smoother
++   * 28.3 fps, measured with the overscan of the test builds).
++   *
++   * The slave's filter reads one row below the screen, which does not
++   * exist: the bottom line mixes in a little of another buffer.  An
++   * overscan row/column fixed it (tests 2-8) but was dropped by choice for
++   * the 0.3 fps it cost. */
++  gc->bInfo->h3quincunx = (_GlideRoot.environment.quincunxMode == 11) ? 2 : 1;
++  GDBG_INFO(80, "%s: Quincunx %s requested for this open\n", FN_NAME,
++            (gc->bInfo->h3quincunx == 2) ? "smoother" : "sharper");
++
++  if (GETENV("FX_GLIDE_AA_CLIP") == NULL)
++  {
++    qxAaClipValue = _GlideRoot.environment.aaClip;
++    qxAaClipSaved = FXTRUE;
++    _GlideRoot.environment.aaClip = FXFALSE;
++  }
++
++  /* FX_GLIDE_QX_JITTER=0 keeps the stock/FX_GLIDE_AA2_* jitter, which is
++   * what the zero-jitter diagnostic profiles need. */
++  envStr = GETENV("FX_GLIDE_QX_JITTER");
++  if ((envStr != NULL) && (atol(envStr) == 0))
++    return;
++
++  {
++    /* Default: invert Y when the application uses a lower-left origin,
++     * so the corner stays the top-left corner on the screen. */
++    FxBool flipY = (gc->state.origin == GR_ORIGIN_LOWER_LEFT);
++    FxU32 centreX, centreY, cornerX, cornerY;
++
++    envStr = GETENV("FX_GLIDE_QX_YFLIP");
++    if (envStr != NULL)
++      flipY = (atol(envStr) != 0) && (gc->state.origin == GR_ORIGIN_LOWER_LEFT);
++
++    centreX = _grQxJitterValue("FX_GLIDE_QX_CENTER_X", "0.0", FXFALSE);
++    centreY = _grQxJitterValue("FX_GLIDE_QX_CENTER_Y", "0.0", flipY);
++    cornerX = _grQxJitterValue("FX_GLIDE_QX_CORNER_X", "0.5", FXFALSE);
++    cornerY = _grQxJitterValue("FX_GLIDE_QX_CORNER_Y", "0.5", flipY);
++
++    qxJitterRowIndex = gc->sampleOffsetIndex;
++    for (i = 0; i < 8; i++)
++    {
++      qxJitterSavedX[i] = _GlideRoot.environment.aaXOffset[qxJitterRowIndex][i];
++      qxJitterSavedY[i] = _GlideRoot.environment.aaYOffset[qxJitterRowIndex][i];
++
++      /* _grAAOffsetValue: chip c uses entries 2c and 2c+1 (mod 8). */
++      if (((i >> 1) & 1) == 0)
++      {
++        _GlideRoot.environment.aaXOffset[qxJitterRowIndex][i] = centreX;
++        _GlideRoot.environment.aaYOffset[qxJitterRowIndex][i] = centreY;
++      }
++      else
++      {
++        _GlideRoot.environment.aaXOffset[qxJitterRowIndex][i] = cornerX;
++        _GlideRoot.environment.aaYOffset[qxJitterRowIndex][i] = cornerY;
++      }
++    }
++    qxJitterRowSaved = FXTRUE;
++
++    GDBG_INFO(80, "%s: jitter row %d centre=(%02x,%02x) corner=(%02x,%02x) flipY=%d\n",
++              FN_NAME, qxJitterRowIndex, centreX, centreY, cornerX, cornerY, flipY);
++  }
++#undef FN_NAME
++}
++
+ /*-------------------------------------------------------------------
+   Function: grSstWinOpen
+   Date: 3/16
+@@ -2345,6 +2536,9 @@ GR_EXT_ENTRY(grSstWinOpenExt, GrContext_t, (FxU32 hWnd, GrScreenResolution_t res
+     if (gc->chipCount == 4)
+       gc->bInfo->h3analogSli = 1;
+ 
++    /* Quincunx 1.0: decide now, after every SLI/AA fallback above. */
++    _grQuincunxSetup(gc);
++
+     GDBG_INFO(80, "%s: sliCount = %d\n", FN_NAME, gc->sliCount);
+     GDBG_INFO(80, "%s: chipCount = %d\n", FN_NAME, gc->chipCount);
+ 
+@@ -2547,6 +2741,12 @@ GR_EXT_ENTRY(grSstWinOpenExt, GrContext_t, (FxU32 hWnd, GrScreenResolution_t res
+       return 0;
+     }
+ 
++    /* Quincunx 1.0: minihwc clears h3quincunx when the slave video path
++     * could not be set up; keep the stock 2x AA jitter in that case.
++     * aaCtrl is programmed later in this function, so this is in time. */
++    if (!bInfo->h3quincunx)
++      _grQuincunxRestoreJitter();
++
+     /* Restore the function specializations if the user is trying to
+      * recover. This only resets the non-null environment. The actual
+      * function specializations are recovered later in the mainline
+diff --git a/glide3x/h5/minihwc/minihwc.c b/glide3x/h5/minihwc/minihwc.c
+index d0902f1..271c804 100644
+--- a/glide3x/h5/minihwc/minihwc.c
++++ b/glide3x/h5/minihwc/minihwc.c
+@@ -1,4 +1,10 @@
+ /*
++** MODIFIED FILE - Quincunx 1.1 (Quincunx anti-aliasing for the Voodoo5 5500).
++** Changed from the 3dfx sources 3.10.0.40408 in October 2026
++** (Quincunx 1.0: 25-26 Oct 2026, Quincunx 1.1: 26-29 Oct 2026).
++** Every change is marked "Quincunx" in the comments.
++*/
++/*
+ ** THIS SOFTWARE IS SUBJECT TO COPYRIGHT PROTECTION AND IS OFFERED ONLY
+ ** PURSUANT TO THE 3DFX GLIDE GENERAL PUBLIC LICENSE. THERE IS NO RIGHT
+ ** TO USE THE GLIDE TRADEMARK WITHOUT PRIOR WRITTEN PERMISSION OF 3DFX
+@@ -4125,6 +4131,464 @@ hwcExecuteStatusWinFifo(hwcBoardInfo*     bInfo,
+ 
+ #endif /* HWC_ACCESS_GDX */
+ 
++/*----------------------------------------------------------------------
++  Quincunx 1.0 - video resolve on the slave VSA-100
++
++  Requested by glide3 (_grQuincunxSetup) through bInfo->h3quincunx for
++  the dual-chip, 2-sample, no-SLI, digital configuration, where every
++  chip renders one full sample and the master averages its own PIPE with
++  the slave PIPE arriving through the AA FIFO (cfgVideoCtrl0 on the
++  master: PIPE_PLUS_AAFIFO, divide by 2).
++
++  Only the slave video unit is changed: its overlay scaler is enabled
++  in both directions with a 1:1 step and a half-pixel start phase, and
++  its filter is set to bilinear.  The slave PIPE then carries the mean
++  of the four samples around each pixel, and the stock mux produces
++
++      OUT = 1/2 centre + 1/8 (four corners)
++
++  Notes taken from this source tree:
++  - after SLI/AA setup the slave snoops writes to the master's memBase0
++    (cfgInitEnable: MEMBASE0_SNOOP_ENABLE, see hwcSetSLIAAMode in
++    lin_mode.c), so a master register write also lands on the slave.
++    Slave-only state is therefore written through slaveIOBase, after
++    the last master video write of hwcInitVideo.
++  - the slave geometry copy and the vidProcCfg disable/enable pulse
++    follow the reference sequence in hwcSetSLIAAMode (lin_mode.c).
++  - vidOverlayDudx/Dvdy are 0.20 and 20 bits wide, so 1.0 cannot be
++    written: 0xFFFFF is used, and the start phase carries a small
++    correction so that the fraction stays at one half across the line.
++
++  Everything except the 1:1 step is overridable from the environment
++  or the glide registry key, so the phase can be calibrated on the
++  board without rebuilding:
++    FX_GLIDE_QX_PHASE_X / FX_GLIDE_QX_PHASE_Y  start offset (0.19)
++    FX_GLIDE_QX_FILTER   0..3 (3 = bilinear, 0 = point for diagnosis)
++    FX_GLIDE_QX_LOG      path of a text log, e.g. C:\qx.log
++  ----------------------------------------------------------------------*/
++#include <stdio.h>
++#include <stdarg.h>
++
++#define HWC_QX_DDA_STEP          0x000FFFFFUL   /* 1 - 2^-20 in 0.20 */
++#define HWC_QX_HALF_PHASE        0x00040000UL   /* 0.5 in 0.19       */
++
++typedef struct hwcQxSaved_s {
++  hwcBoardInfo *owner;
++  FxU32 vidProcCfg;
++  FxU32 vidScreenSize;
++  FxU32 vidOverlayStartCoords;
++  FxU32 vidOverlayEndScreenCoord;
++  FxU32 vidDesktopOverlayStride;
++  FxU32 vidOverlayDudxOffsetSrcWidth;
++  FxU32 vidOverlayDudx;
++  FxU32 vidOverlayDvdy;
++  FxU32 vidOverlayDvdyOffset;
++  FxU32 vidPixelBufThold;
++  FxU32 vidMaxRGBDelta;
++  /* Quadrunx (experimental): the master scaler is changed too. */
++  FxBool masterSaved;
++  FxU32 mVidProcCfg;
++  FxU32 mVidOverlayDudx;
++  FxU32 mVidOverlayDvdy;
++  FxU32 mVidOverlayDudxOffsetSrcWidth;
++  FxU32 mVidOverlayDvdyOffset;
++} hwcQxSaved;
++
++static hwcQxSaved hwcQxState;
++
++static void
++hwcQxLog(const char *fmt, ...)
++{
++  const char *path = GETENV("FX_GLIDE_QX_LOG");
++  FILE *fp;
++  va_list args;
++
++  if ((path == NULL) || (path[0] == '\0'))
++    return;
++
++  fp = fopen(path, "a");
++  if (fp == NULL)
++    return;
++
++  va_start(args, fmt);
++  vfprintf(fp, fmt, args);
++  va_end(args);
++  fclose(fp);
++}
++
++static FxU32
++hwcQxEnv(const char *name, FxU32 defVal)
++{
++  const char *str = GETENV(name);
++
++  if ((str == NULL) || (str[0] == '\0'))
++    return defVal;
++
++  return (FxU32)strtoul(str, NULL, 0);
++}
++
++static void
++hwcQuincunxRestore(hwcBoardInfo *bInfo)
++{
++#define FN_NAME "hwcQuincunxRestore"
++  FxU32 cfg;
++
++  if ((bInfo == NULL) || (hwcQxState.owner != bInfo))
++    return;
++
++  /* Quadrunx: master first (its writes may be snooped by the slave,
++   * which is restored right after). */
++  if (hwcQxState.masterSaved)
++  {
++    HWC_IO_STORE(bInfo->regInfo, vidProcCfg,
++                 hwcQxState.mVidProcCfg & ~(SST_OVERLAY_HORIZ_SCALE_EN |
++                                            SST_OVERLAY_VERT_SCALE_EN));
++    HWC_IO_STORE(bInfo->regInfo, vidOverlayDudx, hwcQxState.mVidOverlayDudx);
++    HWC_IO_STORE(bInfo->regInfo, vidOverlayDvdy, hwcQxState.mVidOverlayDvdy);
++    HWC_IO_STORE(bInfo->regInfo, vidOverlayDudxOffsetSrcWidth,
++                 hwcQxState.mVidOverlayDudxOffsetSrcWidth);
++    HWC_IO_STORE(bInfo->regInfo, vidOverlayDvdyOffset,
++                 hwcQxState.mVidOverlayDvdyOffset);
++    HWC_IO_STORE(bInfo->regInfo, vidProcCfg, hwcQxState.mVidProcCfg);
++    hwcQxState.masterSaved = FXFALSE;
++    hwcQxLog("Quincunx 1.1: master video state restored (master filter)\n");
++  }
++
++  if (bInfo->regInfo.slaveIOBase[0] != 0)
++  {
++    /* Stop the slave scaler first, then put back what we found. */
++    HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidProcCfg, cfg);
++    cfg &= ~(SST_OVERLAY_HORIZ_SCALE_EN |
++             SST_OVERLAY_VERT_SCALE_EN |
++             SST_OVERLAY_FILTER_MODE);
++    HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidProcCfg, cfg);
++
++    HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidOverlayDudx,
++                       hwcQxState.vidOverlayDudx);
++    HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidOverlayDvdy,
++                       hwcQxState.vidOverlayDvdy);
++    HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidOverlayDvdyOffset,
++                       hwcQxState.vidOverlayDvdyOffset);
++    HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidOverlayDudxOffsetSrcWidth,
++                       hwcQxState.vidOverlayDudxOffsetSrcWidth);
++    HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidScreenSize,
++                       hwcQxState.vidScreenSize);
++    HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidOverlayStartCoords,
++                       hwcQxState.vidOverlayStartCoords);
++    HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidOverlayEndScreenCoord,
++                       hwcQxState.vidOverlayEndScreenCoord);
++    HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidDesktopOverlayStride,
++                       hwcQxState.vidDesktopOverlayStride);
++    HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidPixelBufThold,
++                       hwcQxState.vidPixelBufThold);
++    HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidMaxRGBDelta,
++                       hwcQxState.vidMaxRGBDelta);
++    HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidProcCfg,
++                       hwcQxState.vidProcCfg);
++  }
++
++  hwcQxLog("Quincunx 1.1: slave video state restored\n");
++  GDBG_INFO(80, "%s: slave video state restored\n", FN_NAME);
++  hwcQxState.owner = NULL;
++#undef FN_NAME
++}
++
++static FxBool hwcQuincunxApplyChecked(hwcBoardInfo *bInfo);
++
++/* Clears h3quincunx when the video path cannot be used, so that glide3
++ * puts the stock jitter back instead of rendering Quincunx samples
++ * without the matching filter. */
++static FxBool
++hwcQuincunxApply(hwcBoardInfo *bInfo)
++{
++  FxBool active;
++
++  if (!bInfo->h3quincunx)
++    return FXFALSE;
++
++  active = hwcQuincunxApplyChecked(bInfo);
++  if (!active)
++    bInfo->h3quincunx = 0;
++  return active;
++}
++
++static FxBool
++hwcQuincunxApplyChecked(hwcBoardInfo *bInfo)
++{
++#define FN_NAME "hwcQuincunxApply"
++  FxU32 mCfg, mSize, mStart, mEnd, mStride, mDudxOfs, mDudx, mDvdy, mDvdyOfs;
++  FxU32 sCfg, sCfgNew, filter, scaler, scaleBits;
++  FxU32 width, height;
++  FxU32 phaseX, phaseY, packedDudx, phaseYOfs;
++  FxU32 stepX, stepY, mThold, sThold, sDelta, newDelta;
++  FxU32 rb[11];
++  FxU32 mCfgNew = 0;
++  FxBool ok;
++  /* Variant chosen in glide3 from SSTH3_SLI_AA_CONFIGURATION, stored in
++   * h3quincunx:
++   *   1 sharper  (10): master centre, unfiltered; slave corner, filtered
++   *   2 smoother (11): as sharper, and the master scaler filters too
++   * "quad" below means: the master scaler is programmed as well. */
++  FxBool quad = (bInfo->h3quincunx == 2);
++  const char *modeName = quad ? " SMOOTHER" : " SHARPER";
++
++  if (!bInfo->h3quincunx)
++    return FXFALSE;
++
++  /* One owner at a time; re-entry from the same board starts clean. */
++  if (hwcQxState.owner != NULL)
++  {
++    if (hwcQxState.owner != bInfo)
++      return FXFALSE;
++    hwcQuincunxRestore(bInfo);
++  }
++
++  hwcQxLog("Quincunx 1.1: apply%s, chips=%lu samples=%lu sli=%lu analog=%lu 2nd=%lu\n",
++           modeName,
++           (unsigned long)bInfo->pciInfo.numChips,
++           (unsigned long)bInfo->h3pixelSample,
++           (unsigned long)bInfo->h3nwaySli,
++           (unsigned long)bInfo->h3analogSli,
++           (unsigned long)bInfo->buffInfo.enable2ndbuffer);
++
++  if (!IS_NAPALM(bInfo->pciInfo.deviceID) ||
++      (bInfo->pciInfo.numChips != 2) ||
++      (bInfo->h3pixelSample != 2) ||
++      (bInfo->h3nwaySli > 1) ||
++      (bInfo->h3analogSli != 0) ||
++      (bInfo->buffInfo.enable2ndbuffer) ||
++      (bInfo->regInfo.slaveIOBase[0] == 0))
++  {
++    hwcQxLog("Quincunx 1.1: not eligible, stock 2x AA kept\n");
++    return FXFALSE;
++  }
++
++  HWC_IO_LOAD(bInfo->regInfo, vidProcCfg, mCfg);
++  HWC_IO_LOAD(bInfo->regInfo, vidScreenSize, mSize);
++  HWC_IO_LOAD(bInfo->regInfo, vidOverlayStartCoords, mStart);
++  HWC_IO_LOAD(bInfo->regInfo, vidOverlayEndScreenCoord, mEnd);
++  HWC_IO_LOAD(bInfo->regInfo, vidDesktopOverlayStride, mStride);
++  HWC_IO_LOAD(bInfo->regInfo, vidOverlayDudxOffsetSrcWidth, mDudxOfs);
++  HWC_IO_LOAD(bInfo->regInfo, vidOverlayDudx, mDudx);
++  HWC_IO_LOAD(bInfo->regInfo, vidOverlayDvdy, mDvdy);
++  HWC_IO_LOAD(bInfo->regInfo, vidOverlayDvdyOffset, mDvdyOfs);
++
++  width  = (mSize & SST_VIDEO_SCREEN_WIDTH)  >> SST_VIDEO_SCREEN_WIDTH_SHIFT;
++  height = (mSize & SST_VIDEO_SCREEN_HEIGHT) >> SST_VIDEO_SCREEN_HEIGHT_SHIFT;
++
++  hwcQxLog("Quincunx 1.1: master cfg=%08lx size=%08lx (%lux%lu) start=%08lx end=%08lx stride=%08lx dudxOfs=%08lx dudx=%08lx dvdy=%08lx dvdyOfs=%08lx\n",
++           (unsigned long)mCfg, (unsigned long)mSize,
++           (unsigned long)width, (unsigned long)height,
++           (unsigned long)mStart, (unsigned long)mEnd, (unsigned long)mStride,
++           (unsigned long)mDudxOfs, (unsigned long)mDudx, (unsigned long)mDvdy,
++           (unsigned long)mDvdyOfs);
++
++  /* The master must show a full-screen, unscaled, tiled overlay.
++   * The desktop surface may stay enabled underneath (the XP driver keeps
++   * it on, measured on a Voodoo5 5500: vidProcCfg 036c0181), but without
++   * chroma keying, so the overlay covers the whole screen. */
++  {
++    const char *why = NULL;
++
++    if ((width == 0) || (height == 0) ||
++        (width != bInfo->vidInfo.xRes) || (height != bInfo->vidInfo.yRes))
++      why = "screen size differs from the Glide resolution";
++    else if (!(mCfg & SST_OVERLAY_EN) || !(mCfg & SST_OVERLAY_TILED_EN))
++      why = "overlay off or not tiled";
++    else if (mCfg & (SST_OVERLAY_HORIZ_SCALE_EN | SST_OVERLAY_VERT_SCALE_EN))
++      why = "master overlay already scaled";
++    else if (mCfg & (SST_HALF_MODE | SST_INTERLACED_EN))
++      why = "half or interlaced video mode";
++    else if ((mCfg & SST_VIDEO_2X_MODE_EN) && !hwcQxEnv("FX_GLIDE_QX_ALLOW_2X", 0))
++      why = "2x video mode (set FX_GLIDE_QX_ALLOW_2X=1 to try it)";
++    else if (mCfg & SST_OVERLAY_STEREO_EN)
++      why = "stereo overlay";
++    else if (mCfg & SST_CHROMA_EN)
++      why = "chroma key on (overlay does not cover the desktop)";
++    else if (((mStart & (SST_OVERLAY_X | SST_OVERLAY_Y)) != 0) ||
++             (((mEnd & SST_OVERLAY_X) >> SST_OVERLAY_X_SHIFT) != (width - 1)) ||
++             (((mEnd & SST_OVERLAY_Y) >> SST_OVERLAY_Y_SHIFT) != (height - 1)))
++      why = "overlay window is not full screen";
++
++    if (why != NULL)
++    {
++      hwcQxLog("Quincunx 1.1: master video state not as expected (%s), stock 2x AA kept\n", why);
++      return FXFALSE;
++    }
++  }
++
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidProcCfg, sCfg);
++  if ((sCfg & SST_OVERLAY_PIXEL_FORMAT) != (mCfg & SST_OVERLAY_PIXEL_FORMAT))
++  {
++    hwcQxLog("Quincunx 1.1: slave pixel format %08lx differs from master %08lx, stock 2x AA kept\n",
++             (unsigned long)(sCfg & SST_OVERLAY_PIXEL_FORMAT),
++             (unsigned long)(mCfg & SST_OVERLAY_PIXEL_FORMAT));
++    return FXFALSE;
++  }
++
++  /* Save the slave before the first write. */
++  hwcQxState.vidProcCfg = sCfg;
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidScreenSize, hwcQxState.vidScreenSize);
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidOverlayStartCoords, hwcQxState.vidOverlayStartCoords);
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidOverlayEndScreenCoord, hwcQxState.vidOverlayEndScreenCoord);
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidDesktopOverlayStride, hwcQxState.vidDesktopOverlayStride);
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidOverlayDudxOffsetSrcWidth, hwcQxState.vidOverlayDudxOffsetSrcWidth);
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidOverlayDudx, hwcQxState.vidOverlayDudx);
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidOverlayDvdy, hwcQxState.vidOverlayDvdy);
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidOverlayDvdyOffset, hwcQxState.vidOverlayDvdyOffset);
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidPixelBufThold, sThold);
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidMaxRGBDelta, sDelta);
++  HWC_IO_LOAD(bInfo->regInfo, vidPixelBufThold, mThold);
++  hwcQxState.vidPixelBufThold = sThold;
++  hwcQxState.vidMaxRGBDelta = sDelta;
++  hwcQxState.masterSaved = FXFALSE;
++  hwcQxState.owner = bInfo;
++
++  hwcQxLog("Quincunx 1.1: slave before cfg=%08lx size=%08lx start=%08lx end=%08lx stride=%08lx dudxOfs=%08lx dudx=%08lx dvdy=%08lx dvdyOfs=%08lx\n",
++           (unsigned long)hwcQxState.vidProcCfg, (unsigned long)hwcQxState.vidScreenSize,
++           (unsigned long)hwcQxState.vidOverlayStartCoords,
++           (unsigned long)hwcQxState.vidOverlayEndScreenCoord,
++           (unsigned long)hwcQxState.vidDesktopOverlayStride,
++           (unsigned long)hwcQxState.vidOverlayDudxOffsetSrcWidth,
++           (unsigned long)hwcQxState.vidOverlayDudx,
++           (unsigned long)hwcQxState.vidOverlayDvdy,
++           (unsigned long)hwcQxState.vidOverlayDvdyOffset);
++
++  /* Start phase: one half plus extent/2 in 0.19, which offsets the
++   * 2^-20 per pixel shortfall of the 0xFFFFF step over the line. */
++  phaseX = hwcQxEnv("FX_GLIDE_QX_PHASE_X", HWC_QX_HALF_PHASE + (width  >> 1));
++  phaseY = hwcQxEnv("FX_GLIDE_QX_PHASE_Y", HWC_QX_HALF_PHASE + (height >> 1));
++  filter = hwcQxEnv("FX_GLIDE_QX_FILTER", 3) & 0x3;
++
++  /* 1.1 test knobs (defaults = the verified 1.0 setup):
++   *   FX_GLIDE_QX_SCALER    bit0 horizontal, bit1 vertical scaler (3)
++   *   FX_GLIDE_QX_DUDX/DVDY scaler steps, 0.20 (0xFFFFF)
++   *   FX_GLIDE_QX_THOLD     1 = copy the master vidPixelBufThold (1)
++   *   FX_GLIDE_QX_MAXDELTA  slave vidMaxRGBDelta for the 2x2 filter
++   *   FX_GLIDE_QX_ALLOW_2X  1 = also try in 2x video mode (0) */
++  scaler = hwcQxEnv("FX_GLIDE_QX_SCALER", 3) & 0x3;
++  scaleBits = ((scaler & 1) ? SST_OVERLAY_HORIZ_SCALE_EN : 0) |
++              ((scaler & 2) ? SST_OVERLAY_VERT_SCALE_EN : 0);
++  stepX = hwcQxEnv("FX_GLIDE_QX_DUDX", HWC_QX_DDA_STEP) & SST_OVERLAY_DELTA;
++  stepY = hwcQxEnv("FX_GLIDE_QX_DVDY", HWC_QX_DDA_STEP) & SST_OVERLAY_DELTA;
++  newDelta = hwcQxEnv("FX_GLIDE_QX_MAXDELTA", sDelta);
++
++  packedDudx = (mDudxOfs & ~SST_OVERLAY_DELTA_OFFSET) |
++               (phaseX & SST_OVERLAY_DELTA_OFFSET);
++  phaseYOfs  = phaseY & SST_OVERLAY_DELTA_OFFSET;
++
++  sCfgNew = (sCfg & ~(SST_OVERLAY_FILTER_MODE |
++                      SST_OVERLAY_HORIZ_SCALE_EN |
++                      SST_OVERLAY_VERT_SCALE_EN)) |
++            scaleBits |
++            (filter << SST_OVERLAY_FILTER_MODE_SHIFT);
++
++  /* Quadrunx: the master overlay gets the same scaler and filter.  Done
++   * before the slave-only writes, so whatever the slave snoops from these
++   * is overwritten by its own values below.  No disable pulse here: the
++   * master also scans out the desktop. */
++  if (quad)
++  {
++    hwcQxState.mVidProcCfg = mCfg;
++    hwcQxState.mVidOverlayDudx = mDudx;
++    hwcQxState.mVidOverlayDvdy = mDvdy;
++    hwcQxState.mVidOverlayDudxOffsetSrcWidth = mDudxOfs;
++    hwcQxState.mVidOverlayDvdyOffset = mDvdyOfs;
++    hwcQxState.masterSaved = FXTRUE;
++
++    mCfgNew = (mCfg & ~(SST_OVERLAY_FILTER_MODE |
++                        SST_OVERLAY_HORIZ_SCALE_EN |
++                        SST_OVERLAY_VERT_SCALE_EN)) |
++              scaleBits |
++              (filter << SST_OVERLAY_FILTER_MODE_SHIFT);
++    HWC_IO_STORE(bInfo->regInfo, vidOverlayDudx, stepX);
++    HWC_IO_STORE(bInfo->regInfo, vidOverlayDvdy, stepY);
++    HWC_IO_STORE(bInfo->regInfo, vidOverlayDudxOffsetSrcWidth, packedDudx);
++    HWC_IO_STORE(bInfo->regInfo, vidOverlayDvdyOffset, phaseYOfs);
++    HWC_IO_STORE(bInfo->regInfo, vidProcCfg, mCfgNew);
++  }
++
++  /* Geometry identical to the master (same set as hwcSetSLIAAMode). */
++  HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidScreenSize, mSize);
++  HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidOverlayStartCoords, mStart);
++  HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidOverlayEndScreenCoord, mEnd);
++  HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidDesktopOverlayStride, mStride);
++
++  /* 1:1 bilinear DDA with half-pixel start phase. */
++  HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidOverlayDudx, stepX);
++  HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidOverlayDvdy, stepY);
++
++  /* The master's FIFO threshold is written before snooping is set up,
++   * so the slave would otherwise keep its power-on value. */
++  /* Braces needed: the HWC_IO_* macros expand to two statements. */
++  if (hwcQxEnv("FX_GLIDE_QX_THOLD", 1)) {
++    HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidPixelBufThold, mThold);
++  }
++  HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidMaxRGBDelta, newDelta);
++  HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidOverlayDudxOffsetSrcWidth, packedDudx);
++  HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidOverlayDvdyOffset, phaseYOfs);
++
++  /* Pulse the video processor so the new setup takes effect,
++   * as the reference SLI/AA code does after changing the size. */
++  HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidProcCfg, sCfgNew & ~SST_VIDEO_PROCESSOR_EN);
++  HWC_IO_STORE_SLAVE(1, bInfo->regInfo, vidProcCfg, sCfgNew | (sCfg & SST_VIDEO_PROCESSOR_EN));
++
++  /* Read back the slave, and prove the master was not touched. */
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidProcCfg, rb[0]);
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidOverlayDudx, rb[1]);
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidOverlayDvdy, rb[2]);
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidOverlayDudxOffsetSrcWidth, rb[3]);
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidOverlayDvdyOffset, rb[4]);
++  HWC_IO_LOAD(bInfo->regInfo, vidProcCfg, rb[5]);
++  HWC_IO_LOAD(bInfo->regInfo, vidOverlayDudx, rb[6]);
++  HWC_IO_LOAD(bInfo->regInfo, vidOverlayDvdy, rb[7]);
++  HWC_IO_LOAD(bInfo->regInfo, vidOverlayDudxOffsetSrcWidth, rb[8]);
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidPixelBufThold, rb[9]);
++  HWC_IO_LOAD_SLAVE(1, bInfo->regInfo, vidMaxRGBDelta, rb[10]);
++  hwcQxLog("Quincunx 1.1: thold master=%08lx slave before=%08lx after=%08lx | maxRGBDelta slave before=%08lx after=%08lx | scaler=%lu stepX=%05lx stepY=%05lx\n",
++           (unsigned long)mThold, (unsigned long)sThold, (unsigned long)rb[9],
++           (unsigned long)sDelta, (unsigned long)rb[10],
++           (unsigned long)scaler, (unsigned long)stepX, (unsigned long)stepY);
++
++  hwcQxLog("Quincunx 1.1: slave after cfg=%08lx dudx=%08lx dvdy=%08lx dudxOfs=%08lx dvdyOfs=%08lx | master cfg=%08lx dudx=%08lx dvdy=%08lx dudxOfs=%08lx\n",
++           (unsigned long)rb[0], (unsigned long)rb[1], (unsigned long)rb[2],
++           (unsigned long)rb[3], (unsigned long)rb[4], (unsigned long)rb[5],
++           (unsigned long)rb[6], (unsigned long)rb[7], (unsigned long)rb[8]);
++
++  ok = ((rb[0] & (SST_OVERLAY_HORIZ_SCALE_EN | SST_OVERLAY_VERT_SCALE_EN |
++                  SST_OVERLAY_FILTER_MODE)) ==
++        (sCfgNew & (SST_OVERLAY_HORIZ_SCALE_EN | SST_OVERLAY_VERT_SCALE_EN |
++                    SST_OVERLAY_FILTER_MODE))) &&
++       ((rb[1] & SST_OVERLAY_DELTA) == stepX) &&
++       ((rb[2] & SST_OVERLAY_DELTA) == stepY) &&
++       (rb[3] == packedDudx) &&
++       ((rb[4] & SST_OVERLAY_DELTA_OFFSET) == phaseYOfs) &&
++       (quad ? ((rb[5] == mCfgNew) &&
++                ((rb[6] & SST_OVERLAY_DELTA) == stepX) &&
++                ((rb[7] & SST_OVERLAY_DELTA) == stepY) &&
++                (rb[8] == packedDudx))
++             : ((rb[5] == mCfg) &&
++                (rb[6] == mDudx) &&
++                (rb[7] == mDvdy) &&
++                (rb[8] == mDudxOfs)));
++
++  if (!ok)
++  {
++    hwcQxLog("Quincunx 1.1: readback mismatch, rolling back to stock 2x AA\n");
++    hwcQuincunxRestore(bInfo);
++    return FXFALSE;
++  }
++
++  hwcQxLog("Quincunx 1.1: ACTIVE%s %lux%lu phaseX=%05lx phaseY=%05lx filter=%lu\n",
++           modeName,
++           (unsigned long)width, (unsigned long)height,
++           (unsigned long)(phaseX & SST_OVERLAY_DELTA_OFFSET),
++           (unsigned long)phaseYOfs, (unsigned long)filter);
++  GDBG_INFO(80, "%s: Quincunx 1.1 active\n", FN_NAME);
++  return FXTRUE;
++#undef FN_NAME
++}
++
+ FxBool
+ hwcInitVideo(hwcBoardInfo *bInfo, FxBool tiled, FxVideoTimingInfo *vidTiming,
+              FxU32 pixFmt, FxBool overlay)
+@@ -4311,7 +4775,9 @@ hwcInitVideo(hwcBoardInfo *bInfo, FxBool tiled, FxVideoTimingInfo *vidTiming,
+    /* Video pixel buffer threshold */
+    {
+       FxU32 vidPixelBufThold;
+-      FxU32 thold = 32;
++      /* Quincunx 1.1: 48 measured best with the slave filter on
++       * (Quake III 1024x768x32: 30.2 fps at 32, 30.4 at 48, 56 corrupts). */
++      FxU32 thold = bInfo->h3quincunx ? 48 : 32;
+ 
+       if (GETENV("SSTVB_PIXTHOLD"))
+          thold = atoi(GETENV("SSTVB_PIXTHOLD"));
+@@ -5347,6 +5813,10 @@ hwcInitVideo(hwcBoardInfo *bInfo, FxBool tiled, FxVideoTimingInfo *vidTiming,
+   HWC_IO_STORE(bInfo->regInfo, vidProcCfg, vidProcCfg | SST_VIDEO_PROCESSOR_EN);
+ #endif
+ 
++  /* Quincunx 1.0: must follow the last master video write above,
++   * because master writes are snooped by the slave. */
++  hwcQuincunxApply(bInfo);
++
+   return FXTRUE;
+ 
+ #undef FN_NAME
+@@ -5364,6 +5834,10 @@ hwcRestoreVideo(hwcBoardInfo *bInfo)
+   HWC_CAGP_STORE(bInfo->regInfo, cmdFifo0.baseSize, 0);
+   #endif
+ 
++  /* Quincunx 1.0: give the slave video unit back its stock state
++   * before SLI/AA is torn down. */
++  hwcQuincunxRestore(bInfo);
++
+   /* reset pci registers */
+ #ifdef FX_GLIDE_NAPALM
+ #ifdef HWC_EXT_INIT
+diff --git a/glide3x/h5/minihwc/minihwc.h b/glide3x/h5/minihwc/minihwc.h
+index 4cf2b80..ca6dafa 100644
+--- a/glide3x/h5/minihwc/minihwc.h
++++ b/glide3x/h5/minihwc/minihwc.h
+@@ -1,4 +1,10 @@
+ /*
++** MODIFIED FILE - Quincunx 1.1 (Quincunx anti-aliasing for the Voodoo5 5500).
++** Changed from the 3dfx sources 3.10.0.40408 in October 2026
++** (Quincunx 1.0: 25-26 Oct 2026, Quincunx 1.1: 26-29 Oct 2026).
++** Every change is marked "Quincunx" in the comments.
++*/
++/*
+ ** THIS SOFTWARE IS SUBJECT TO COPYRIGHT PROTECTION AND IS OFFERED ONL
+ ** PURSUANT TO THE 3DFX GLIDE GENERAL PUBLIC LICENSE. THERE IS NO RIGH
+ ** TO USE THE GLIDE TRADEMARK WITHOUT PRIOR WRITTEN PERMISSION OF 3DF
+@@ -478,6 +484,7 @@ typedef struct hwcBoardInfo_s {
+     h3nwaySli,                  /* nway sli, sli = 1 (default), 2, or 4 */
+     h3sliBandHeight,            /* Number of scanlines per chip in SLI. */
+     h3analogSli,                /* TRUE IFF analog sli is requested */
++    h3quincunx,                 /* Quincunx 1.0: slave bilinear resolve requested */
+     boardNum,                   /* Board ID for hwc */
+     deviceNum;                  /* Device ID for PCILib */
+   hwcPCIInfo
+--- a/glide3x/Makefile.win32
++++ b/glide3x/Makefile.win32
+@@ -1,3 +1,5 @@
++# MODIFIED FILE - Quincunx 1.1: BUILD_NUMBER raised from 40408 to 40409 (29 Oct 2026).
++#
+ # Win32 makefile for Glide3 and Texus2
+ # This makefile MUST be processed by GNU make!!!
+ #
+@@ -50,7 +52,7 @@
+ 
+ .PHONY: all clean realclean
+ 
+-export BUILD_NUMBER = 40408
++export BUILD_NUMBER = 40409
+ export FX_GLIDE_HW ?= h5
+ 
+ ifeq ($(FX_GLIDE_HW),sst96)
